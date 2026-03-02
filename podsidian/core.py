@@ -145,8 +145,8 @@ class PodcastProcessor:
         if os.path.exists(model_path):
             cmd.extend(["--model-path", model_path])
         else:
-            # Let WhisperKit download the model using repo format
-            cmd.extend(["--model", f"argmaxinc/whisperkit-coreml_whisper-{model_name}"])
+            # Let WhisperKit download the model (just the model name, e.g. "medium.en")
+            cmd.extend(["--model", model_name])
 
         # Add language if specified
         if language:
@@ -201,7 +201,7 @@ class PodcastProcessor:
 
     def _download_audio(self, url: str) -> str:
         """Download audio file to temporary location."""
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=(30, 300))
         response.raise_for_status()
 
         # Create temp file with .mp3 extension for whisper
@@ -743,7 +743,7 @@ CHANGES MADE:
                 "messages": [
                     {
                         "role": "user",
-                        "content": self.config.openrouter_prompt.format(transcript=transcript),
+                        "content": self.config.openrouter_prompt.replace("{transcript}", transcript),
                     }
                 ],
             },
@@ -791,7 +791,7 @@ CHANGES MADE:
                 "messages": [
                     {
                         "role": "user",
-                        "content": self.config.value_prompt.format(transcript=transcript),
+                        "content": self.config.value_prompt.replace("{transcript}", transcript),
                     }
                 ],
             },
@@ -934,21 +934,26 @@ CHANGES MADE:
         )
 
         # Format note using template
-        note_content = self.config.note_template.format(
-            title=episode.title,
-            podcast_title=episode.podcast.title,
-            published_at=episode.published_at.strftime("%Y-%m-%d")
+        # Use safe substitution to avoid issues with curly braces in content
+        # (e.g. JSON in value_analysis or code snippets in transcripts)
+        replacements = {
+            "title": episode.title,
+            "podcast_title": episode.podcast.title,
+            "published_at": episode.published_at.strftime("%Y-%m-%d")
             if episode.published_at
             else "Unknown",
-            audio_url=episode.audio_url,
-            podcasts_app_url=podcasts_app_url,
-            summary=summary,
-            value_analysis=value_analysis,
-            transcript=episode.transcript or "Transcript not available",
-            episode_id=episode.id,
-            episode_wordcount=transcript_wordcount,
-            podcast_guid=episode.guid,
-        )
+            "audio_url": episode.audio_url,
+            "podcasts_app_url": podcasts_app_url,
+            "summary": summary,
+            "value_analysis": value_analysis,
+            "transcript": episode.transcript or "Transcript not available",
+            "episode_id": str(episode.id),
+            "episode_wordcount": str(transcript_wordcount),
+            "podcast_guid": episode.guid,
+        }
+        note_content = self.config.note_template
+        for key, value in replacements.items():
+            note_content = note_content.replace("{" + key + "}", str(value) if value else "")
 
         md_file = vault_path / filename
         with md_file.open("w") as f:
@@ -1032,8 +1037,21 @@ CHANGES MADE:
                     )
                 continue
 
-            # Parse feed
-            feed = feedparser.parse(sub["feed_url"])
+            # Parse feed (with timeout to avoid hanging on unresponsive feeds)
+            try:
+                import urllib.request
+
+                resp = urllib.request.urlopen(sub["feed_url"], timeout=30)
+                feed = feedparser.parse(resp)
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "error",
+                            "error": f"Failed to fetch feed for {sub['title']}: {str(e)}",
+                        }
+                    )
+                continue
             recent_entries = []
 
             # First pass: collect recent entries
